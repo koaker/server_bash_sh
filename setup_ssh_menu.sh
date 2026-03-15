@@ -35,9 +35,9 @@ load_current_state() {
     local sshd_dump
     sshd_dump=$(sshd -T 2>/dev/null)
 
-    # 当前监听端口
+    # 当前监听端口（取第一个，防止多 Port 行导致多行匹配使校验失败）
     local current_port
-    current_port=$(echo "$sshd_dump" | grep -i "^port " | awk '{print $2}')
+    current_port=$(echo "$sshd_dump" | grep -i "^port " | awk 'NR==1{print $2}')
     if [[ "$current_port" =~ ^[0-9]+$ ]]; then
         SSH_PORT=$current_port
     fi
@@ -104,7 +104,18 @@ config_user_and_key() {
     elif [ "$user_choice" != "1" ]; then
         echo -e "\033[31m❌ 无效选择。\033[0m"; pause; return
     fi
- 
+
+    # TARGET_USER 确定后重新检查该用户的密钥状态，防止显示旧用户的检测结果
+    local _ak
+    _ak="$(getent passwd "$TARGET_USER" | cut -d: -f6)/.ssh/authorized_keys"
+    if [ -f "$_ak" ] && [ -s "$_ak" ]; then
+        local _kc
+        _kc=$(grep -cE "^(ssh-|ecdsa-|sk-)" "$_ak" 2>/dev/null || echo 0)
+        KEY_CONFIGURED="是 (已有 ${_kc} 个公钥)"
+    else
+        KEY_CONFIGURED="否"
+    fi
+
     USER_HOME=$(getent passwd "$TARGET_USER" | cut -d: -f6)
     SSH_DIR="$USER_HOME/.ssh"
     AUTH_KEYS="$SSH_DIR/authorized_keys"
@@ -214,6 +225,24 @@ apply_and_restart() {
         fi
     fi
  
+    # 注释掉主配置及其他 drop-in 中与本脚本冲突的指令：
+    #   Port          —— 叠加型，多行会同时监听多个端口
+    #   PermitRootLogin / PasswordAuthentication 等 —— 先出现者优先，其他文件的值可能覆盖本脚本
+    local conflict_pattern="^[[:space:]]*(Port|PermitRootLogin|PasswordAuthentication|PubkeyAuthentication|KbdInteractiveAuthentication)[[:space:]]"
+    local main_cfg="/etc/ssh/sshd_config"
+    if grep -qE "$conflict_pattern" "$main_cfg" 2>/dev/null; then
+        sed -i -E "s/${conflict_pattern}/# (由安全加固脚本注释) &/" "$main_cfg"
+        echo "已注释主配置中的冲突指令。"
+    fi
+    for f in /etc/ssh/sshd_config.d/*.conf; do
+        [ "$f" = "$CONFIG_DROPIN" ] && continue
+        [ -f "$f" ] || continue
+        if grep -qE "$conflict_pattern" "$f" 2>/dev/null; then
+            sed -i -E "s/${conflict_pattern}/# (由安全加固脚本注释) &/" "$f"
+            echo "已注释 $f 中的冲突指令。"
+        fi
+    done
+
     echo "正在写入配置文件 $CONFIG_DROPIN ..."
     cat <<EOF > "$CONFIG_DROPIN"
 # 自动生成的 SSH 安全配置项
