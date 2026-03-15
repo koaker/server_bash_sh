@@ -49,6 +49,10 @@ config_user_and_key() {
  
     if [ "$user_choice" == "2" ]; then
         read -p "请输入新用户名: " NEW_USER
+        if [[ ! "$NEW_USER" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; then
+            echo -e "\033[31m❌ 用户名无效，只允许小写字母、数字、下划线和连字符，且必须以字母或下划线开头（最长32位）。\033[0m"
+            pause; return
+        fi
         if id "$NEW_USER" &>/dev/null; then
             echo -e "\033[33m⚠️ 用户 $NEW_USER 已存在，直接使用该用户。\033[0m"
         else
@@ -80,23 +84,30 @@ config_user_and_key() {
             echo -e "\033[31m⚠️ $TARGET_USER 的 id_rsa 密钥已存在，取消生成以防覆盖。\033[0m"
         else
             sudo -u "$TARGET_USER" ssh-keygen -t rsa -b 4096 -f "$SSH_DIR/id_rsa" -N "" >/dev/null 2>&1
-            echo -e "\n\033[41;37m 🚨 高危提示：请立即复制并妥善保存以下 私钥 (Private Key)！ \033[0m"
-            echo -e "\033[31m 丢失此私钥将导致您无法登录！\033[0m"
-            echo -e "======================================================="
-            cat "$SSH_DIR/id_rsa"
-            echo -e "=======================================================\n"
+            echo -e "\n\033[32m✅ 密钥对已生成：$SSH_DIR/id_rsa\033[0m"
+            echo -e "\033[33m⚠️  私钥保存在服务器上，请通过安全方式（如 scp）将其下载到本地。\033[0m"
+            echo -e "   示例：scp root@<服务器IP>:$SSH_DIR/id_rsa ~/.ssh/id_rsa_server"
+            echo ""
+            read -p "是否在终端明文显示私钥内容？（存在被终端日志记录的风险，y/N）: " show_key
+            if [[ "$show_key" =~ ^[Yy]$ ]]; then
+                echo -e "\n\033[41;37m 🚨 高危提示：请立即复制并妥善保存以下 私钥 (Private Key)！ \033[0m"
+                echo -e "\033[31m 丢失此私钥将导致您无法登录！\033[0m"
+                echo -e "======================================================="
+                cat "$SSH_DIR/id_rsa"
+                echo -e "=======================================================\n"
+                read -p "⚠️ 请确认已复制上述私钥！按回车键继续..."
+            fi
             echo -e "📄 公钥 (Public Key)："
             echo -e "-------------------------------------------------------"
             cat "$SSH_DIR/id_rsa.pub"
             echo -e "-------------------------------------------------------\n"
-            sudo -u "$TARGET_USER" sh -c "cat $SSH_DIR/id_rsa.pub >> $AUTH_KEYS"
+            sudo -u "$TARGET_USER" tee -a "$AUTH_KEYS" < "$SSH_DIR/id_rsa.pub" >/dev/null
             KEY_CONFIGURED="是 (已生成)"
-            read -p "⚠️ 请确认已复制上述私钥！按回车键继续..." 
         fi
     elif [ "$key_choice" == "2" ]; then
         read -p "请粘贴公钥内容: " user_pub_key
         if [ -n "$user_pub_key" ]; then
-            sudo -u "$TARGET_USER" sh -c "echo '$user_pub_key' >> $AUTH_KEYS"
+            printf '%s\n' "$user_pub_key" | sudo -u "$TARGET_USER" tee -a "$AUTH_KEYS" >/dev/null
             KEY_CONFIGURED="是 (手动输入)"
             echo -e "\033[32m✅ 公钥保存成功。\033[0m"
         else
