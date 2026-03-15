@@ -228,17 +228,18 @@ apply_and_restart() {
     # 注释掉主配置及其他 drop-in 中与本脚本冲突的指令：
     #   Port          —— 叠加型，多行会同时监听多个端口
     #   PermitRootLogin / PasswordAuthentication 等 —— 先出现者优先，其他文件的值可能覆盖本脚本
-    local conflict_pattern="^[[:space:]]*(Port|PermitRootLogin|PasswordAuthentication|PubkeyAuthentication|KbdInteractiveAuthentication)[[:space:]]"
+    # 使用地址匹配 + s/^/# / 的方式，比变量展开替换更可靠
+    local conflict_addr='/^[[:space:]]*\(Port\|PermitRootLogin\|PasswordAuthentication\|PubkeyAuthentication\|KbdInteractiveAuthentication\)[[:space:]]/s/^/# /'
     local main_cfg="/etc/ssh/sshd_config"
-    if grep -qE "$conflict_pattern" "$main_cfg" 2>/dev/null; then
-        sed -i -E "s/${conflict_pattern}/# (由安全加固脚本注释) &/" "$main_cfg"
+    if grep -qE "^[[:space:]]*(Port|PermitRootLogin|PasswordAuthentication|PubkeyAuthentication|KbdInteractiveAuthentication)[[:space:]]" "$main_cfg" 2>/dev/null; then
+        sed -i "$conflict_addr" "$main_cfg"
         echo "已注释主配置中的冲突指令。"
     fi
     for f in /etc/ssh/sshd_config.d/*.conf; do
         [ "$f" = "$CONFIG_DROPIN" ] && continue
         [ -f "$f" ] || continue
-        if grep -qE "$conflict_pattern" "$f" 2>/dev/null; then
-            sed -i -E "s/${conflict_pattern}/# (由安全加固脚本注释) &/" "$f"
+        if grep -qE "^[[:space:]]*(Port|PermitRootLogin|PasswordAuthentication|PubkeyAuthentication|KbdInteractiveAuthentication)[[:space:]]" "$f" 2>/dev/null; then
+            sed -i "$conflict_addr" "$f"
             echo "已注释 $f 中的冲突指令。"
         fi
     done
