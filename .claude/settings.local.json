@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(bash -n /home/spocel/code/server_bash_sh/setup_ssh_menu.sh && echo \"语法检查通过\")"
+    ]
+  }
+}

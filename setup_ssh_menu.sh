@@ -25,10 +25,48 @@ else
 fi
  
 SSH_PORT=22
-PERMIT_ROOT="prohibit-password" # 默认: 允许Root密钥登录，禁止密码
+PERMIT_ROOT="prohibit-password"
 FAIL2BAN_ENABLE="未开启"
 KEY_CONFIGURED="否"
 CONFIG_DROPIN="/etc/ssh/sshd_config.d/01-custom-security.conf"
+
+# 读取当前系统实际生效的 SSH 配置
+load_current_state() {
+    local sshd_dump
+    sshd_dump=$(sshd -T 2>/dev/null)
+
+    # 当前监听端口
+    local current_port
+    current_port=$(echo "$sshd_dump" | grep -i "^port " | awk '{print $2}')
+    if [[ "$current_port" =~ ^[0-9]+$ ]]; then
+        SSH_PORT=$current_port
+    fi
+
+    # 当前 Root 登录策略
+    local current_permit
+    current_permit=$(echo "$sshd_dump" | grep -i "^permitrootlogin " | awk '{print $2}')
+    if [ -n "$current_permit" ]; then
+        PERMIT_ROOT="$current_permit"
+    fi
+
+    # 当前 Fail2ban 状态
+    if systemctl is-active --quiet fail2ban 2>/dev/null; then
+        if fail2ban-client status sshd &>/dev/null; then
+            FAIL2BAN_ENABLE="已开启"
+        else
+            FAIL2BAN_ENABLE="已开启 (sshd jail 未启用)"
+        fi
+    fi
+
+    # 当前用户密钥状态
+    local auth_keys
+    auth_keys="$(getent passwd "$TARGET_USER" | cut -d: -f6)/.ssh/authorized_keys"
+    if [ -f "$auth_keys" ] && [ -s "$auth_keys" ]; then
+        local key_count
+        key_count=$(grep -cE "^(ssh-|ecdsa-|sk-)" "$auth_keys" 2>/dev/null || echo 0)
+        KEY_CONFIGURED="是 (已有 ${key_count} 个公钥)"
+    fi
+}
  
 # ==========================================
 # 功能函数定义
@@ -227,6 +265,8 @@ EOF
 # ==========================================
 # 主循环 (UI 界面)
 # ==========================================
+load_current_state
+
 while true; do
     clear
     echo -e "\033[36m===================================================\033[0m"
