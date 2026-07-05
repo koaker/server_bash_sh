@@ -40,6 +40,7 @@ readonly CONF_DIR="${BASE_DIR}/configs"
 readonly XRAY_DIR="${BASE_DIR}/xray-inbounds"
 readonly PORTS_FILE="${BASE_DIR}/ports.json"
 readonly WG_DIR="/etc/wireguard"
+readonly SCHEMA_VERSION=2
 
 # ---------------------------------------------------------------------------
 # Colors
@@ -89,8 +90,34 @@ check_root() {
 init_dirs() {
     mkdir -p "$CONF_DIR" "$XRAY_DIR" "$WG_DIR"
     if [[ ! -f "$PORTS_FILE" ]]; then
-        echo '{"ports":[]}' > "$PORTS_FILE"
+        echo '{"version":2,"ports":[]}' > "$PORTS_FILE"
     fi
+    local current_ver
+    current_ver="$(get_current_version)"
+    if [[ "$current_ver" -lt "$SCHEMA_VERSION" ]]; then
+        warn "Configuration is at version ${current_ver}, current is ${SCHEMA_VERSION}. Run '${SCRIPT_NAME} migrate' to upgrade."
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Schema version helpers
+# ---------------------------------------------------------------------------
+get_current_version() {
+    if [[ ! -f "$PORTS_FILE" ]]; then
+        echo "0"
+        return
+    fi
+    local ver
+    ver="$(jq -r '.version // 0' "$PORTS_FILE")"
+    echo "$ver"
+}
+
+set_schema_version() {
+    local ver="$1"
+    local tmp
+    tmp="$(mktemp)"
+    jq --argjson v "$ver" '.version = $v' "$PORTS_FILE" > "$tmp"
+    mv "$tmp" "$PORTS_FILE"
 }
 
 # ---------------------------------------------------------------------------
@@ -146,6 +173,10 @@ generate_wg_conf() {
     local peers_json="$9"   # JSON array of {public_key, allowed_ips[]}
 
     local conf_file="${CONF_DIR}/${iface}.conf"
+    local proxy_conf_file="${CONF_DIR}/${iface}-proxy.conf"
+
+    # Extract server IP from address (e.g. "10.0.2.1/24" → "10.0.2.1")
+    local server_address_ip="${address%%/*}"
 
     # Build peer blocks
     local peer_blocks=""
@@ -162,19 +193,33 @@ AllowedIPs = ${allowed_ips_str}
 "
     done
 
+    # Generate pure WG conf (no PostUp/PostDown)
     cat > "$conf_file" <<EOF
 [Interface]
 PrivateKey = ${private_key}
 ListenPort = ${listen_port}
 Address = ${address}
 MTU = ${mtu}
-PostUp = ip rule add fwmark ${fwmark} table ${table}; ip route add local default dev lo table ${table}; iptables -t mangle -A PREROUTING -i ${iface} -p tcp -j TPROXY --on-ip 127.0.0.1 --on-port ${xray_port} --tproxy-mark ${fwmark}; iptables -t mangle -A PREROUTING -i ${iface} -p udp -j TPROXY --on-ip 127.0.0.1 --on-port ${xray_port} --tproxy-mark ${fwmark}; iptables -I INPUT 1 -i ${iface} -m mark --mark ${fwmark} -j ACCEPT
-PostDown = iptables -D INPUT -i ${iface} -m mark --mark ${fwmark} -j ACCEPT 2>/dev/null || true; ip rule del fwmark ${fwmark} table ${table}; ip route del local default dev lo table ${table}; iptables -t mangle -D PREROUTING -i ${iface} -p tcp -j TPROXY --on-ip 127.0.0.1 --on-port ${xray_port} --tproxy-mark ${fwmark}; iptables -t mangle -D PREROUTING -i ${iface} -p udp -j TPROXY --on-ip 127.0.0.1 --on-port ${xray_port} --tproxy-mark ${fwmark}
 ${peer_blocks}
 EOF
 
     chmod 600 "$conf_file"
     success "Generated ${conf_file}"
+
+    # Generate proxy conf (with TPROXY PostUp/PostDown)
+    cat > "$proxy_conf_file" <<EOF
+[Interface]
+PrivateKey = ${private_key}
+ListenPort = ${listen_port}
+Address = ${address}
+MTU = ${mtu}
+PostUp = ip rule add fwmark ${fwmark} table ${table}; ip route add local default dev lo table ${table}; iptables -t mangle -A PREROUTING -i ${iface} -d ${server_address_ip}/32 -j RETURN; iptables -t mangle -A PREROUTING -i ${iface} -p tcp -j TPROXY --on-ip 127.0.0.1 --on-port ${xray_port} --tproxy-mark ${fwmark}; iptables -t mangle -A PREROUTING -i ${iface} -p udp -j TPROXY --on-ip 127.0.0.1 --on-port ${xray_port} --tproxy-mark ${fwmark}; iptables -I INPUT 1 -i ${iface} -m mark --mark ${fwmark} -j ACCEPT
+PostDown = iptables -D INPUT -i ${iface} -m mark --mark ${fwmark} -j ACCEPT 2>/dev/null || true; ip rule del fwmark ${fwmark} table ${table}; ip route del local default dev lo table ${table}; iptables -t mangle -D PREROUTING -i ${iface} -d ${server_address_ip}/32 -j RETURN 2>/dev/null || true; iptables -t mangle -D PREROUTING -i ${iface} -p tcp -j TPROXY --on-ip 127.0.0.1 --on-port ${xray_port} --tproxy-mark ${fwmark}; iptables -t mangle -D PREROUTING -i ${iface} -p udp -j TPROXY --on-ip 127.0.0.1 --on-port ${xray_port} --tproxy-mark ${fwmark}
+${peer_blocks}
+EOF
+
+    chmod 600 "$proxy_conf_file"
+    success "Generated ${proxy_conf_file}"
 }
 
 # ---------------------------------------------------------------------------
@@ -216,8 +261,12 @@ generate_xray_inbound() {
 # ---------------------------------------------------------------------------
 symlink_conf() {
     local iface="$1"
-    local src="${CONF_DIR}/${iface}.conf"
+    local mode="${2:-proxy}"  # "proxy" or "pure"
+    local suffix=""
+    [[ "$mode" == "proxy" ]] && suffix="-proxy"
+    local src="${CONF_DIR}/${iface}${suffix}.conf"
     local dst="${WG_DIR}/${iface}.conf"
+    [[ -f "$src" ]] || { error "Config not found: ${src}"; return 1; }
     if [[ -L "$dst" ]]; then
         rm -f "$dst"
     fi
@@ -433,8 +482,8 @@ EOF
     # Generate xray inbound JSON
     generate_xray_inbound "$wg_port" "$xray_port"
 
-    # Symlink to /etc/wireguard/
-    symlink_conf "$iface"
+    # Symlink to /etc/wireguard/ (default: proxy mode with TPROXY enabled)
+    symlink_conf "$iface" "proxy"
 
     # Save metadata to ports.json
     local entry
@@ -449,6 +498,7 @@ EOF
         --arg spk "$server_private_key" \
         --arg spub "$server_public_key" \
         --argjson clients "$clients_meta" \
+        --argjson tproxy true \
         '{
             port: $port,
             xray_port: $xp,
@@ -459,7 +509,8 @@ EOF
             mtu: $mtu,
             server_private_key: $spk,
             server_public_key: $spub,
-            clients: $clients
+            clients: $clients,
+            tproxy_enabled: $tproxy
         }')"
     port_add "$entry"
     success "Saved metadata to ${PORTS_FILE}"
@@ -508,6 +559,8 @@ cmd_remove() {
     local xray_file="${XRAY_DIR}/${iface}.json"
 
     [[ -f "$conf_file" ]] && rm -f "$conf_file" && info "Removed ${conf_file}"
+    local proxy_conf_file="${CONF_DIR}/${iface}-proxy.conf"
+    [[ -f "$proxy_conf_file" ]] && rm -f "$proxy_conf_file" && info "Removed ${proxy_conf_file}"
     [[ -f "$xray_file" ]] && rm -f "$xray_file" && info "Removed ${xray_file}"
     remove_symlink "$iface"
 
@@ -650,6 +703,13 @@ _show_status() {
     echo -e "  Endpoint:     ${endpoint}"
     echo -e "  fwmark:       ${fwmark}"
     echo -e "  Table:        ${table}"
+    local tproxy_mode
+    tproxy_mode="$(_get_tproxy_mode "$port")"
+    if [[ "$tproxy_mode" == "proxy" ]]; then
+        echo -e "  TPROXY:       ${GREEN}ENABLED${RESET}"
+    else
+        echo -e "  TPROXY:       ${YELLOW}DISABLED${RESET}"
+    fi
 
     if iface_is_up "$iface"; then
         echo -e "  Status:       ${GREEN}UP${RESET}"
@@ -711,9 +771,17 @@ export_wg() {
     local port="${1:-}"
     [[ -n "$port" ]] || die "Usage: ${SCRIPT_NAME} export wg <port>"
     port_exists "$port" || die "Port ${port} is not configured."
-    local conf_file="${CONF_DIR}/wg-${port}.conf"
+    local iface="wg-${port}"
+    local mode
+    mode="$(_get_tproxy_mode "$port")"
+    local conf_file
+    if [[ "$mode" == "proxy" ]]; then
+        conf_file="${CONF_DIR}/${iface}-proxy.conf"
+    else
+        conf_file="${CONF_DIR}/${iface}.conf"
+    fi
     [[ -f "$conf_file" ]] || die "Config file not found: ${conf_file}"
-    header "WG Server Config: wg-${port}"
+    header "WG Server Config: ${iface} (mode: ${mode})"
     cat "$conf_file"
 }
 
@@ -893,6 +961,385 @@ export_link() {
 }
 
 # ---------------------------------------------------------------------------
+# CMD: tproxy
+# ---------------------------------------------------------------------------
+cmd_tproxy() {
+    local action="${1:-}"
+    local port="${2:-}"
+
+    case "$action" in
+        enable)
+            [[ -n "$port" ]] || die "Usage: ${SCRIPT_NAME} tproxy enable <port>"
+            [[ "$port" =~ ^[0-9]+$ ]] || die "Port must be numeric."
+            port_exists "$port" || die "Port ${port} is not configured."
+            local iface="wg-${port}"
+
+            # Check current state
+            local current_mode
+            current_mode="$(_get_tproxy_mode "$port")"
+            if [[ "$current_mode" == "proxy" ]]; then
+                warn "TPROXY is already enabled for ${iface}."
+                return 0
+            fi
+
+            info "Enabling TPROXY for ${iface}..."
+            if iface_is_up "$iface"; then
+                wg-quick down "$iface" || warn "wg-quick down failed."
+            fi
+            symlink_conf "$iface" "proxy"
+            wg-quick up "$iface" && success "TPROXY enabled. ${iface} is UP with proxy rules." || die "Failed to start ${iface}."
+            _set_tproxy_state "$port" true
+            ;;
+        disable)
+            [[ -n "$port" ]] || die "Usage: ${SCRIPT_NAME} tproxy disable <port>"
+            [[ "$port" =~ ^[0-9]+$ ]] || die "Port must be numeric."
+            port_exists "$port" || die "Port ${port} is not configured."
+            local iface="wg-${port}"
+
+            local current_mode
+            current_mode="$(_get_tproxy_mode "$port")"
+            if [[ "$current_mode" == "pure" ]]; then
+                warn "TPROXY is already disabled for ${iface}."
+                return 0
+            fi
+
+            info "Disabling TPROXY for ${iface}..."
+            if iface_is_up "$iface"; then
+                wg-quick down "$iface" || warn "wg-quick down failed."
+            fi
+            symlink_conf "$iface" "pure"
+            wg-quick up "$iface" && success "TPROXY disabled. ${iface} is UP without proxy rules." || die "Failed to start ${iface}."
+            _set_tproxy_state "$port" false
+            ;;
+        status)
+            if [[ -n "$port" ]]; then
+                port_exists "$port" || die "Port ${port} is not configured."
+                _show_tproxy_status "$port"
+            else
+                header "TPROXY Status"
+                local count
+                count="$(jq '.ports | length' "$PORTS_FILE")"
+                if [[ "$count" -eq 0 ]]; then
+                    echo "No tunnels configured."
+                    return 0
+                fi
+                jq -r '.ports[].port' "$PORTS_FILE" | while IFS= read -r p; do
+                    _show_tproxy_status "$p"
+                done
+            fi
+            ;;
+        --help|-h|"")
+            cat <<EOF
+Usage: ${SCRIPT_NAME} tproxy <action> [port]
+
+Actions:
+  enable  <port>   Enable TPROXY (restarts WG with proxy config)
+  disable <port>   Disable TPROXY (restarts WG with pure config)
+  status  [port]   Show TPROXY state (all tunnels if port omitted)
+EOF
+            ;;
+        *)
+            die "Unknown tproxy action: ${action}. Use enable/disable/status."
+            ;;
+    esac
+}
+
+_get_tproxy_mode() {
+    local port="$1"
+    local iface="wg-${port}"
+    local dst="${WG_DIR}/${iface}.conf"
+    if [[ -L "$dst" ]]; then
+        local target
+        target="$(readlink "$dst")"
+        if [[ "$target" == *"-proxy.conf" ]]; then
+            echo "proxy"
+        else
+            echo "pure"
+        fi
+    else
+        # Fallback: check ports.json
+        local enabled
+        enabled="$(jq -r --argjson p "$port" '.ports[] | select(.port == $p) | .tproxy_enabled // true' "$PORTS_FILE")"
+        if [[ "$enabled" == "true" ]]; then
+            echo "proxy"
+        else
+            echo "pure"
+        fi
+    fi
+}
+
+_set_tproxy_state() {
+    local port="$1"
+    local enabled="$2"  # true or false
+    local tmp
+    tmp="$(mktemp)"
+    jq --argjson p "$port" --argjson e "$enabled" \
+        '(.ports[] | select(.port == $p)).tproxy_enabled = $e' "$PORTS_FILE" > "$tmp"
+    mv "$tmp" "$PORTS_FILE"
+}
+
+_show_tproxy_status() {
+    local port="$1"
+    local iface="wg-${port}"
+    local mode
+    mode="$(_get_tproxy_mode "$port")"
+
+    local status_icon
+    if [[ "$mode" == "proxy" ]]; then
+        status_icon="${GREEN}ENABLED${RESET}"
+    else
+        status_icon="${YELLOW}DISABLED${RESET}"
+    fi
+
+    local up_icon
+    if iface_is_up "$iface"; then
+        up_icon="${GREEN}UP${RESET}"
+    else
+        up_icon="${RED}DOWN${RESET}"
+    fi
+
+    printf "  %-14s  WG: %-4b  TPROXY: %-10b\n" "$iface" "$up_icon" "$status_icon"
+}
+
+# ---------------------------------------------------------------------------
+# CMD: migrate
+# ---------------------------------------------------------------------------
+migrate_v0_to_v1() {
+    local dry_run="$1"
+    # Ensure ports.json exists with at least version 1 structure
+    if [[ ! -f "$PORTS_FILE" ]]; then
+        if [[ "$dry_run" == "true" ]]; then
+            info "[DRY RUN] Would create ${PORTS_FILE} with {\"version\":1,\"ports\":[]}"
+        else
+            echo '{"version":1,"ports":[]}' > "$PORTS_FILE"
+            success "Created ${PORTS_FILE} with version 1 structure."
+        fi
+    else
+        info "ports.json already exists — v0→v1 is a no-op for existing data."
+    fi
+}
+
+migrate_v1_to_v2() {
+    local dry_run="$1"
+
+    header "Migration v1 → v2: dual-conf + tproxy_enabled"
+
+    local count
+    count="$(jq '.ports | length' "$PORTS_FILE")"
+
+    if [[ "$count" -eq 0 ]]; then
+        info "No tunnel entries to migrate."
+    fi
+
+    # Collect interfaces that are currently up so we can restart them
+    local -a was_up=()
+
+    # --- Step a: stop all running interfaces ---
+    if [[ "$dry_run" == "true" ]]; then
+        jq -r '.ports[].interface' "$PORTS_FILE" | while IFS= read -r iface; do
+            if iface_is_up "$iface"; then
+                info "[DRY RUN] Would bring down ${iface}"
+            fi
+        done
+    else
+        while IFS= read -r iface; do
+            if iface_is_up "$iface"; then
+                info "Bringing down ${iface}..."
+                wg-quick down "$iface" && was_up+=("$iface") || warn "wg-quick down ${iface} failed — continuing."
+            fi
+        done < <(jq -r '.ports[].interface' "$PORTS_FILE")
+    fi
+
+    # --- Step b: migrate each tunnel's conf files ---
+    while IFS= read -r port; do
+        local iface="wg-${port}"
+        local old_conf="${CONF_DIR}/${iface}.conf"
+        local proxy_conf="${CONF_DIR}/${iface}-proxy.conf"
+        local pure_conf="${CONF_DIR}/${iface}.conf"
+        local dst="${WG_DIR}/${iface}.conf"
+
+        info "Processing ${iface}..."
+
+        # Check if already migrated (proxy conf already exists)
+        if [[ -f "$proxy_conf" ]]; then
+            info "  ${iface}: proxy conf already exists — skipping file migration."
+        elif [[ -f "$old_conf" ]]; then
+            if [[ "$dry_run" == "true" ]]; then
+                info "[DRY RUN] Would rename ${old_conf} → ${proxy_conf}"
+                info "[DRY RUN] Would generate pure conf at ${pure_conf} (strip PostUp/PostDown)"
+                info "[DRY RUN] Would patch ${proxy_conf} to add server-IP RETURN rule if missing"
+            else
+                # Rename old conf to proxy conf
+                mv "$old_conf" "$proxy_conf"
+                info "  Renamed ${old_conf} → ${proxy_conf}"
+
+                # Patch proxy conf: insert -d <server_ip>/32 -j RETURN before first -p tcp -j TPROXY
+                # Only patch if the RETURN rule is not already present
+                local server_ip
+                server_ip="$(grep '^Address' "$proxy_conf" | awk '{print $3}' | cut -d'/' -f1)"
+                if [[ -n "$server_ip" ]]; then
+                    local return_rule="-d ${server_ip}/32 -j RETURN"
+                    if ! grep -q "$return_rule" "$proxy_conf"; then
+                        # Insert the RETURN rule in PostUp before the first -p tcp -j TPROXY
+                        sed -i "s|-p tcp -j TPROXY|${return_rule}; iptables -t mangle -A PREROUTING -i ${iface} -p tcp -j TPROXY|" "$proxy_conf"
+                        # Insert the RETURN rule cleanup in PostDown before the first -p tcp -j TPROXY
+                        sed -i "/^PostDown/s|-p tcp -j TPROXY|${return_rule} 2>/dev/null || true; iptables -t mangle -D PREROUTING -i ${iface} -p tcp -j TPROXY|" "$proxy_conf"
+                        info "  Patched ${proxy_conf} with server-IP RETURN rule (${server_ip}/32)"
+                    else
+                        info "  ${proxy_conf} already has RETURN rule — skipping patch."
+                    fi
+                else
+                    warn "  Could not extract server IP from ${proxy_conf} — skipping RETURN rule patch."
+                fi
+
+                # Generate pure conf by stripping PostUp/PostDown
+                grep -v '^PostUp\|^PostDown' "$proxy_conf" > "$pure_conf"
+                chmod 600 "$pure_conf"
+                info "  Generated pure conf at ${pure_conf}"
+            fi
+        else
+            warn "  ${iface}: no conf file found at ${old_conf} — skipping."
+        fi
+
+        # Update symlink to point to proxy conf
+        if [[ "$dry_run" == "true" ]]; then
+            local current_target=""
+            [[ -L "$dst" ]] && current_target="$(readlink "$dst")"
+            if [[ "$current_target" == *"-proxy.conf" ]]; then
+                info "[DRY RUN] ${iface}: symlink already points to proxy conf — no change needed."
+            else
+                info "[DRY RUN] Would update symlink ${dst} → ${proxy_conf}"
+            fi
+        else
+            if [[ -L "$dst" ]]; then
+                local current_target
+                current_target="$(readlink "$dst")"
+                if [[ "$current_target" == *"-proxy.conf" ]]; then
+                    info "  ${iface}: symlink already points to proxy conf — skipping."
+                else
+                    rm -f "$dst"
+                    ln -s "$proxy_conf" "$dst"
+                    info "  Updated symlink ${dst} → ${proxy_conf}"
+                fi
+            elif [[ -f "$proxy_conf" ]]; then
+                ln -s "$proxy_conf" "$dst"
+                info "  Created symlink ${dst} → ${proxy_conf}"
+            fi
+        fi
+
+    done < <(jq -r '.ports[].port' "$PORTS_FILE")
+
+    # --- Step c: add tproxy_enabled to each port entry if missing ---
+    if [[ "$dry_run" == "true" ]]; then
+        local needs_tproxy
+        needs_tproxy="$(jq '[.ports[] | select(.tproxy_enabled == null)] | length' "$PORTS_FILE")"
+        if [[ "$needs_tproxy" -gt 0 ]]; then
+            info "[DRY RUN] Would set tproxy_enabled=true on ${needs_tproxy} port entry(ies) missing the field."
+        else
+            info "[DRY RUN] All port entries already have tproxy_enabled — no change needed."
+        fi
+    else
+        local tmp
+        tmp="$(mktemp)"
+        jq '(.ports[] | select(.tproxy_enabled == null)).tproxy_enabled = true' "$PORTS_FILE" > "$tmp"
+        mv "$tmp" "$PORTS_FILE"
+        success "Set tproxy_enabled=true on all port entries that were missing it."
+    fi
+
+    # --- Step d: set version to 2 ---
+    if [[ "$dry_run" == "true" ]]; then
+        info "[DRY RUN] Would set ports.json version to 2."
+    else
+        set_schema_version 2
+        success "Set ports.json schema version to 2."
+    fi
+
+    # --- Step e: restart interfaces that were up ---
+    if [[ "$dry_run" == "true" ]]; then
+        jq -r '.ports[].interface' "$PORTS_FILE" | while IFS= read -r iface; do
+            if iface_is_up "$iface"; then
+                : # already up, nothing to restart in dry-run
+            else
+                info "[DRY RUN] Would bring up ${iface} after migration."
+            fi
+        done
+    else
+        for iface in "${was_up[@]:-}"; do
+            [[ -n "$iface" ]] || continue
+            info "Restarting ${iface}..."
+            wg-quick up "$iface" && success "${iface} restarted." || warn "Failed to restart ${iface} — start it manually."
+        done
+    fi
+}
+
+cmd_migrate() {
+    local dry_run="false"
+
+    # Parse flags
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --dry-run)
+                dry_run="true"
+                shift
+                ;;
+            --help|-h)
+                cat <<EOF
+Usage: ${SCRIPT_NAME} migrate [--dry-run]
+
+Migrate configuration to the current schema version (v${SCHEMA_VERSION}).
+
+Options:
+  --dry-run   Show what would be done without making any changes
+  --help, -h  Show this help
+EOF
+                return 0
+                ;;
+            *)
+                die "Unknown option: $1"
+                ;;
+        esac
+    done
+
+    header "Configuration Migration"
+
+    local current_ver
+    current_ver="$(get_current_version)"
+
+    info "Current schema version : ${current_ver}"
+    info "Target schema version  : ${SCHEMA_VERSION}"
+
+    if [[ "$current_ver" -ge "$SCHEMA_VERSION" ]]; then
+        success "Already up to date (version ${current_ver})."
+        return 0
+    fi
+
+    if [[ "$dry_run" == "true" ]]; then
+        warn "DRY RUN mode — no changes will be made."
+    fi
+
+    # Run migrations sequentially
+    if [[ "$current_ver" -lt 1 ]]; then
+        info "Running migration: v0 → v1"
+        migrate_v0_to_v1 "$dry_run"
+        [[ "$dry_run" == "true" ]] || current_ver=1
+    fi
+
+    if [[ "$current_ver" -lt 2 ]]; then
+        info "Running migration: v1 → v2"
+        migrate_v1_to_v2 "$dry_run"
+        [[ "$dry_run" == "true" ]] || current_ver=2
+    fi
+
+    if [[ "$dry_run" == "true" ]]; then
+        echo ""
+        info "Dry run complete. No changes were made."
+    else
+        echo ""
+        success "Migration complete. Schema is now at version ${SCHEMA_VERSION}."
+    fi
+}
+
+# ---------------------------------------------------------------------------
 # Global help
 # ---------------------------------------------------------------------------
 show_help() {
@@ -910,6 +1357,8 @@ ${BOLD}COMMANDS${RESET}
   stop   [port]          Stop interface(s)  — all if no port given
   restart [port]         Restart interface(s)
   status  [port]         Show detailed status (wg show, iptables, ip rules)
+  tproxy <action> [port] Toggle TPROXY (enable/disable/status)
+  migrate [--dry-run]    Migrate configuration to current schema version
   export  <sub> ...      Export configurations (see below)
 
 ${BOLD}EXPORT SUB-COMMANDS${RESET}
@@ -981,6 +1430,8 @@ main() {
         stop)     cmd_stop "$@" ;;
         restart)  cmd_restart "$@" ;;
         status)   cmd_status "$@" ;;
+        tproxy)   cmd_tproxy "$@" ;;
+        migrate)  cmd_migrate "$@" ;;
         export)   cmd_export "$@" ;;
         --help|-h|help|"")
             show_help
