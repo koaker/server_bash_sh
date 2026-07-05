@@ -1179,11 +1179,11 @@ migrate_v1_to_v2() {
                 server_ip="$(grep '^Address' "$proxy_conf" | awk '{print $3}' | cut -d'/' -f1)"
                 if [[ -n "$server_ip" ]]; then
                     local return_rule="-d ${server_ip}/32 -j RETURN"
-                    if ! grep -q "$return_rule" "$proxy_conf"; then
+                    if ! grep -qF -- "$return_rule" "$proxy_conf"; then
                         # Insert the RETURN rule in PostUp before the first -p tcp -j TPROXY
-                        sed -i "s|-p tcp -j TPROXY|${return_rule}; iptables -t mangle -A PREROUTING -i ${iface} -p tcp -j TPROXY|" "$proxy_conf"
+                        sed -i "s|-p tcp -j TPROXY|$return_rule; iptables -t mangle -A PREROUTING -i $iface -p tcp -j TPROXY|" "$proxy_conf"
                         # Insert the RETURN rule cleanup in PostDown before the first -p tcp -j TPROXY
-                        sed -i "/^PostDown/s|-p tcp -j TPROXY|${return_rule} 2>/dev/null || true; iptables -t mangle -D PREROUTING -i ${iface} -p tcp -j TPROXY|" "$proxy_conf"
+                        sed -i "/^PostDown/s|-p tcp -j TPROXY|$return_rule 2>/dev/null || true; iptables -t mangle -D PREROUTING -i $iface -p tcp -j TPROXY|" "$proxy_conf"
                         info "  Patched ${proxy_conf} with server-IP RETURN rule (${server_ip}/32)"
                     else
                         info "  ${proxy_conf} already has RETURN rule — skipping patch."
