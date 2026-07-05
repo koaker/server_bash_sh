@@ -1150,55 +1150,54 @@ migrate_v1_to_v2() {
         done < <(jq -r '.ports[].interface' "$PORTS_FILE")
     fi
 
-    # --- Step b: migrate each tunnel's conf files ---
-    while IFS= read -r port; do
-        local iface="wg-${port}"
-        local old_conf="${CONF_DIR}/${iface}.conf"
-        local proxy_conf="${CONF_DIR}/${iface}-proxy.conf"
+    # --- Step b: regenerate conf files from ports.json metadata ---
+    while IFS= read -r entry_json; do
+        local port iface xray_port fwmark table mtu server_private_key
+        port="$(echo "$entry_json" | jq -r '.port')"
+        iface="$(echo "$entry_json" | jq -r '.interface')"
+        xray_port="$(echo "$entry_json" | jq -r '.xray_port')"
+        fwmark="$(echo "$entry_json" | jq -r '.fwmark')"
+        table="$(echo "$entry_json" | jq -r '.table')"
+        mtu="$(echo "$entry_json" | jq -r '.mtu')"
+        server_private_key="$(echo "$entry_json" | jq -r '.server_private_key')"
+
         local pure_conf="${CONF_DIR}/${iface}.conf"
+        local proxy_conf="${CONF_DIR}/${iface}-proxy.conf"
         local dst="${WG_DIR}/${iface}.conf"
 
         info "Processing ${iface}..."
 
-        # Check if already migrated (proxy conf already exists)
-        if [[ -f "$proxy_conf" ]]; then
-            info "  ${iface}: proxy conf already exists — skipping file migration."
-        elif [[ -f "$old_conf" ]]; then
-            if [[ "$dry_run" == "true" ]]; then
-                info "[DRY RUN] Would rename ${old_conf} → ${proxy_conf}"
-                info "[DRY RUN] Would generate pure conf at ${pure_conf} (strip PostUp/PostDown)"
-                info "[DRY RUN] Would patch ${proxy_conf} to add server-IP RETURN rule if missing"
-            else
-                # Rename old conf to proxy conf
-                mv "$old_conf" "$proxy_conf"
-                info "  Renamed ${old_conf} → ${proxy_conf}"
-
-                # Patch proxy conf: insert -d <server_ip>/32 -j RETURN before first -p tcp -j TPROXY
-                # Only patch if the RETURN rule is not already present
-                local server_ip
-                server_ip="$(grep '^Address' "$proxy_conf" | awk '{print $3}' | cut -d'/' -f1)"
-                if [[ -n "$server_ip" ]]; then
-                    local return_rule="-d ${server_ip}/32 -j RETURN"
-                    if ! grep -qF -- "$return_rule" "$proxy_conf"; then
-                        # Insert the RETURN rule in PostUp before the first -p tcp -j TPROXY
-                        sed -i "s|-p tcp -j TPROXY|$return_rule; iptables -t mangle -A PREROUTING -i $iface -p tcp -j TPROXY|" "$proxy_conf"
-                        # Insert the RETURN rule cleanup in PostDown before the first -p tcp -j TPROXY
-                        sed -i "/^PostDown/s|-p tcp -j TPROXY|$return_rule 2>/dev/null || true; iptables -t mangle -D PREROUTING -i $iface -p tcp -j TPROXY|" "$proxy_conf"
-                        info "  Patched ${proxy_conf} with server-IP RETURN rule (${server_ip}/32)"
-                    else
-                        info "  ${proxy_conf} already has RETURN rule — skipping patch."
-                    fi
-                else
-                    warn "  Could not extract server IP from ${proxy_conf} — skipping RETURN rule patch."
-                fi
-
-                # Generate pure conf by stripping PostUp/PostDown
-                grep -v '^PostUp\|^PostDown' "$proxy_conf" > "$pure_conf"
-                chmod 600 "$pure_conf"
-                info "  Generated pure conf at ${pure_conf}"
-            fi
+        # Check if both configs already exist (already migrated)
+        if [[ -f "$pure_conf" && -f "$proxy_conf" ]]; then
+            info "  ${iface}: both pure and proxy confs exist — skipping regeneration."
         else
-            warn "  ${iface}: no conf file found at ${old_conf} — skipping."
+            if [[ "$dry_run" == "true" ]]; then
+                info "[DRY RUN] Would regenerate ${pure_conf} and ${proxy_conf} from ports.json metadata"
+            else
+                # Remove old single conf if it exists (it has PostUp baked in)
+                [[ -f "$pure_conf" && ! -f "$proxy_conf" ]] && rm -f "$pure_conf"
+
+                # Derive server address from first client's allowed IP
+                local first_client_ip server_address
+                first_client_ip="$(echo "$entry_json" | jq -r '.clients[0].allowed_ips[0] // "10.0.0.2/32"')"
+                server_address="$(derive_server_address "$first_client_ip")"
+
+                # Build peers JSON array for generate_wg_conf
+                local peers_json
+                peers_json="$(echo "$entry_json" | jq '[.clients[] | {public_key: .public_key, allowed_ips: .allowed_ips}]')"
+
+                # Regenerate both configs using the existing generator
+                generate_wg_conf \
+                    "$iface" \
+                    "$server_private_key" \
+                    "$port" \
+                    "$server_address" \
+                    "$mtu" \
+                    "$xray_port" \
+                    "$fwmark" \
+                    "$table" \
+                    "$peers_json"
+            fi
         fi
 
         # Update symlink to point to proxy conf
@@ -1211,23 +1210,10 @@ migrate_v1_to_v2() {
                 info "[DRY RUN] Would update symlink ${dst} → ${proxy_conf}"
             fi
         else
-            if [[ -L "$dst" ]]; then
-                local current_target
-                current_target="$(readlink "$dst")"
-                if [[ "$current_target" == *"-proxy.conf" ]]; then
-                    info "  ${iface}: symlink already points to proxy conf — skipping."
-                else
-                    rm -f "$dst"
-                    ln -s "$proxy_conf" "$dst"
-                    info "  Updated symlink ${dst} → ${proxy_conf}"
-                fi
-            elif [[ -f "$proxy_conf" ]]; then
-                ln -s "$proxy_conf" "$dst"
-                info "  Created symlink ${dst} → ${proxy_conf}"
-            fi
+            symlink_conf "$iface" "proxy"
         fi
 
-    done < <(jq -r '.ports[].port' "$PORTS_FILE")
+    done < <(jq -c '.ports[]' "$PORTS_FILE")
 
     # --- Step c: add tproxy_enabled to each port entry if missing ---
     if [[ "$dry_run" == "true" ]]; then
